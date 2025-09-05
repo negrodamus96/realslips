@@ -6,20 +6,8 @@ import glob
 import ntpath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
-from PyPDF2 import PdfReader, PdfWriter
-import shutil
-import gc
-from io import BytesIO
-import time
 
 current_path = os.path.abspath(os.getcwd())
-
-# Create necessary directories if they don't exist
-os.makedirs(current_path + '/PDF', exist_ok=True)
-os.makedirs(current_path + '/CSV', exist_ok=True)
-os.makedirs(current_path + '/IMG', exist_ok=True)
-os.makedirs(current_path + '/TEMP', exist_ok=True)
-
 files = glob.glob(current_path + '/PDF' + '/**/*.[pP][dD][fF]', recursive=True)
 list_of_health_values = []
 csv_path = current_path + '/CSV/' + 'data.csv'
@@ -54,80 +42,15 @@ patterns = {
     "pension_pin": re.compile(r"Pension PIN")
 }
 
-# Optimized settings
-MAX_WORKERS = 8  # Adjust based on your CPU cores
-OCR_CONFIG = r'--oem 1 --psm 6 -c tessedit_do_invert=0'
-PDF_CONVERSION_DPI = 200  # Lower DPI for faster processing
-
-def timed_function(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(f"{func.__name__} took {end_time - start_time:.2f} seconds")
-        return result
-    return wrapper
-
 def extract_field_value(line, field_name):
     """Extract field value from a line with single colon"""
     if ":" in line:
         return line.split(":", 1)[1].strip()
     return ""
 
-@timed_function
-def split_pdf_by_pages(pdf_path):
-    """Split a multi-page PDF into individual single-page PDFs using memory buffer"""
-    temp_dir = current_path + '/TEMP'
-    base_filename = os.path.splitext(ntpath.basename(pdf_path))[0]
-    output_files = []
-    
-    try:
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PdfReader(file)
-            total_pages = len(pdf_reader.pages)
-            
-            if total_pages == 1:
-                return [pdf_path]
-            
-            print(f"   Splitting {pdf_path} into {total_pages} individual pages...")
-            
-            for page_num in range(total_pages):
-                pdf_writer = PdfWriter()
-                pdf_writer.add_page(pdf_reader.pages[page_num])
-                
-                # Write to memory first for faster I/O
-                buffer = BytesIO()
-                pdf_writer.write(buffer)
-                buffer.seek(0)
-                
-                output_filename = f"{base_filename}_page_{page_num + 1}.pdf"
-                output_filepath = os.path.join(temp_dir, output_filename)
-                
-                with open(output_filepath, 'wb') as output_file:
-                    output_file.write(buffer.getvalue())
-                
-                output_files.append(output_filepath)
-                buffer.close()
-                
-        return output_files
-        
-    except Exception as e:
-        print(f"Error splitting PDF {pdf_path}: {str(e)}")
-        return [pdf_path]
-
-@timed_function
 def process_image(image):
-    """Process a single image with optimized OCR settings"""
-    # Pre-process image for better performance
-    image = image.convert('L')  # Convert to grayscale
-    
-    content = pytesseract.image_to_string(
-        image, 
-        lang='eng', 
-        output_type=pytesseract.Output.DICT, 
-        config=OCR_CONFIG
-    )
-    
+    """Process a single image and extract data"""
+    content = pytesseract.image_to_string(image, lang='eng', output_type=pytesseract.Output.DICT, config="--psm 6")
     content_list = content["text"].split("\n")
     health_values_dict = {}
     
@@ -258,83 +181,41 @@ def process_image(image):
     
     return health_values_dict
 
-@timed_function
 def process_pdf(pdf_path):
-    """Process a single PDF file with optimized settings"""
+    """Process a single PDF file"""
     filename = ntpath.basename(pdf_path).split(".")[0]
     print(f"Processing: {filename}")
     
-    # Convert PDF to images with optimized settings
+    # Convert PDF to images
     images = convert_from_path(
         pdf_path,
         output_folder=current_path + '/IMG',
-        fmt='jpeg',  # JPEG is faster to process than PNG
-        jpegopt={"quality": 85, "progressive": True, "optimize": True},
-        dpi=PDF_CONVERSION_DPI,  # Reduced DPI for faster processing
+        fmt='png',
         output_file=filename,
-        thread_count=4,
-        grayscale=True,  # Convert to grayscale for faster OCR
+        thread_count=4,  # Use multiple threads for conversion
+        # poppler_path=r"C:\Program Files\poppler-0.68.0\bin"
     )
-    
     print(f'   {len(images)} images converted successfully for {filename}!')
-    print('   OCR processing started. Please wait...')
     
+    print('   OCR processing started. Please wait...')
     health_values_dict = {}
     
-    # Process images in parallel within the same PDF
-    with ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
-        future_to_image = {executor.submit(process_image, image): image for image in images}
-        
-        for future in as_completed(future_to_image):
-            try:
-                result = future.result()
-                health_values_dict.update(result)
-            except Exception as e:
-                print(f"Error processing image: {str(e)}")
-    
-    # Force garbage collection
-    del images
-    gc.collect()
+    # Process all images from this PDF
+    for image in images:
+        result = process_image(image)
+        # Merge results (later images may have better data)
+        health_values_dict.update(result)
     
     return health_values_dict
 
-# Check for already processed files to skip them
-processed_files = set()
-if os.path.exists(csv_path):
-    try:
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Assuming filename is stored in some field, adjust as needed
-                if 'Original Filename' in row:
-                    processed_files.add(row['Original Filename'])
-    except:
-        pass
-
-# First, split all multi-page PDFs into single pages
-all_pdf_files_to_process = []
-for pdf_file in files:
-    filename = ntpath.basename(pdf_file)
-    if filename in processed_files:
-        print(f"Skipping already processed: {filename}")
-        continue
-        
-    print(f"Checking: {filename}")
-    split_files = split_pdf_by_pages(pdf_file)
-    all_pdf_files_to_process.extend(split_files)
-
-print(f"\nTotal files to process: {len(all_pdf_files_to_process)}")
-
-# Process PDFs in parallel with more workers
-with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(all_pdf_files_to_process))) as executor:
-    future_to_pdf = {executor.submit(process_pdf, pdf_path): pdf_path for pdf_path in all_pdf_files_to_process}
+# Process PDFs in parallel
+with ThreadPoolExecutor(max_workers=min(4, len(files))) as executor:
+    future_to_pdf = {executor.submit(process_pdf, pdf_path): pdf_path for pdf_path in files}
     
     for future in as_completed(future_to_pdf):
         pdf_path = future_to_pdf[future]
         try:
             result = future.result()
-            # Add original filename for tracking
-            result['Original Filename'] = ntpath.basename(pdf_path)
             list_of_health_values.append(result)
             print(f"Completed processing: {ntpath.basename(pdf_path)}")
         except Exception as e:
@@ -343,7 +224,7 @@ with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(all_pdf_files_to_proces
 print("\nWriting to CSV file.")
 # Write to file
 with open(csv_path, 'w', newline="", encoding='utf-8') as csvfile: 
-    writer = csv.DictWriter(csvfile, fieldnames=list_of_health_labels + ['Original Filename']) 
+    writer = csv.DictWriter(csvfile, fieldnames=list_of_health_labels) 
     writer.writeheader() 
     writer.writerows(list_of_health_values)
 print("CSV file created!")
@@ -354,22 +235,12 @@ print("\nWould you like to delete the temporary files? [y/n]")
 x = input().strip().lower()
 if x == "y":
     # Delete the images
-    img_files = glob.glob(current_path + '/IMG' + '/*')
-    for f in img_files:
+    files = glob.glob(current_path + '/IMG' + '/*')
+    for f in files:
         try:
             os.remove(f)
         except:
             pass
-    
-    # Delete temporary split PDFs
-    temp_files = glob.glob(current_path + '/TEMP' + '/*')
-    for f in temp_files:
-        try:
-            os.remove(f)
-        except:
-            pass
-    
     print("Temporary files deleted successfully!")
 else:
     print("Skipping cleanup!")
-
