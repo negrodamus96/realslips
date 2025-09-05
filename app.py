@@ -1,3 +1,4 @@
+import streamlit as st
 import pytesseract
 import csv
 from pdf2image import convert_from_path
@@ -6,19 +7,25 @@ import glob
 import ntpath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+from PyPDF2 import PdfReader, PdfWriter
+import gc
+from io import BytesIO
+import tempfile
+import time
+from datetime import datetime
 
+# Streamlit page config
+st.set_page_config(
+    page_title="PDF OCR Processor",
+    page_icon="📄",
+    layout="wide"
+)
+
+# Configuration
 current_path = os.path.abspath(os.getcwd())
-files = glob.glob(current_path + '/PDF' + '/**/*.[pP][dD][fF]', recursive=True)
-list_of_health_values = []
-csv_path = current_path + '/CSV/' + 'data.csv'
-list_of_health_labels = ["Payslip Date", "Employee Name", "IPPIS Number", "Total Gross Earnings", "Total Net Earnings",
-                        "Legacy ID", "MDA/School/Command", "Ministry", "Department", "Location",
-                        "Job", "Grade", "Step", "Gender", "Tax State", "TIN", "Date of Appointment",
-                        "Date of Birth", "", "Bank Name", "Account Number", "PFA Name", "Pension PIN"]
 
-# Pre-compile regex patterns for faster matching
+# Pre-compile regex patterns
 patterns = {
-    "multi_colon": re.compile(r".*:.*:.*"),
     "employee_name": re.compile(r"Employee Name"),
     "ippis_number": re.compile(r"IPPIS Number"),
     "legacy_id": re.compile(r"Legacy ID"),
@@ -42,15 +49,55 @@ patterns = {
     "pension_pin": re.compile(r"Pension PIN")
 }
 
-def extract_field_value(line, field_name):
-    """Extract field value from a line with single colon"""
-    if ":" in line:
-        return line.split(":", 1)[1].strip()
-    return ""
+def extract_field_value(line):
+    return line.split(":", 1)[1].strip() if ":" in line else ""
+
+def split_pdf_by_pages(pdf_path, temp_dir):
+    base_filename = os.path.splitext(ntpath.basename(pdf_path))[0]
+    output_files = []
+    
+    try:
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PdfReader(file)
+            total_pages = len(pdf_reader.pages)
+            
+            if total_pages == 1:
+                return [pdf_path]
+            
+            for page_num in range(total_pages):
+                pdf_writer = PdfWriter()
+                pdf_writer.add_page(pdf_reader.pages[page_num])
+                
+                buffer = BytesIO()
+                pdf_writer.write(buffer)
+                buffer.seek(0)
+                
+                output_filename = f"{base_filename}_page_{page_num + 1}.pdf"
+                output_filepath = os.path.join(temp_dir, output_filename)
+                
+                with open(output_filepath, 'wb') as output_file:
+                    output_file.write(buffer.getvalue())
+                
+                output_files.append(output_filepath)
+                buffer.close()
+                
+        return output_files
+        
+    except Exception as e:
+        st.error(f"Error splitting PDF: {str(e)}")
+        return [pdf_path]
 
 def process_image(image):
-    """Process a single image and extract data"""
-    content = pytesseract.image_to_string(image, lang='eng', output_type=pytesseract.Output.DICT, config="--psm 6")
+    image = image.convert('L')
+    custom_config = r'--oem 1 --psm 6'
+    
+    content = pytesseract.image_to_string(
+        image, 
+        lang='eng', 
+        output_type=pytesseract.Output.DICT, 
+        config=custom_config
+    )
+    
     content_list = content["text"].split("\n")
     health_values_dict = {}
     
@@ -59,16 +106,11 @@ def process_image(image):
         if not line_clean:
             continue
             
-        # Check for multi-colon lines first (more efficient)
         if line_clean.count(":") > 1:
             if patterns["employee_name"].search(line_clean):
-                # Payslip Date logic
                 if i > 0 and content_list[i-1].strip():
                     health_values_dict["Payslip Date"] = content_list[i-1].strip()
-                elif i > 1 and content_list[i-2].strip():
-                    health_values_dict["Payslip Date"] = content_list[i-2].strip()
                 
-                # Extract Employee Name and Grade
                 parts = line_clean.split(":")
                 if len(parts) >= 3:
                     health_values_dict["Employee Name"] = parts[1][:-5].strip() if len(parts[1]) > 5 else parts[1].strip()
@@ -80,49 +122,6 @@ def process_image(image):
                     health_values_dict["IPPIS Number"] = parts[1][:-4].strip() if len(parts[1]) > 4 else parts[1].strip()
                     health_values_dict["Step"] = parts[2].strip()
                     
-            elif patterns["legacy_id"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Legacy ID"] = parts[1][:-6].strip() if len(parts[1]) > 6 else parts[1].strip()
-                    health_values_dict["Gender"] = parts[2].strip()
-                    
-            elif patterns["mda"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["MDA/School/Command"] = parts[1][:-9].strip() if len(parts[1]) > 9 else parts[1].strip()
-                    health_values_dict["Tax State"] = parts[2].strip()
-                    
-            elif patterns["department"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Department"] = parts[1][:-3].strip() if len(parts[1]) > 3 else parts[1].strip()
-                    health_values_dict["TIN"] = parts[2].strip()
-                    
-            elif patterns["location"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Location"] = parts[1][:-19].strip() if len(parts[1]) > 19 else parts[1].strip()
-                    health_values_dict["Date of Appointment"] = parts[2].strip()
-                    
-            elif patterns["job"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Job"] = parts[1][:-13].strip() if len(parts[1]) > 13 else parts[1].strip()
-                    health_values_dict["Date of Birth"] = parts[2].strip()
-                    
-            elif patterns["bank_name"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Bank Name"] = parts[1][:-8].strip() if len(parts[1]) > 8 else parts[1].strip()
-                    health_values_dict["PFA Name"] = parts[2].strip()
-                    
-            elif patterns["account_number"].search(line_clean):
-                parts = line_clean.split(":")
-                if len(parts) >= 3:
-                    health_values_dict["Account Number"] = parts[1][:-11].strip() if len(parts[1]) > 11 else parts[1].strip()
-                    pension_pin = parts[2].replace("|", "").strip()
-                    health_values_dict["Pension PIN"] = pension_pin
-                    
             elif patterns["total_gross"].search(line_clean):
                 parts = line_clean.split(":")
                 if len(parts) >= 2:
@@ -133,114 +132,129 @@ def process_image(image):
                 if len(parts) >= 2:
                     health_values_dict["Total Net Earnings"] = parts[1].replace("N", "").strip()
                     
-        # Single colon lines
         elif line_clean.count(":") == 1:
-            if patterns["employee_name"].search(line_clean):
-                health_values_dict["Employee Name"] = extract_field_value(line_clean, "Employee Name")
-            elif patterns["grade"].search(line_clean):
-                health_values_dict["Grade"] = extract_field_value(line_clean, "Grade")
-            elif patterns["ippis_number"].search(line_clean):
-                health_values_dict["IPPIS Number"] = extract_field_value(line_clean, "IPPIS Number")
-            elif patterns["step"].search(line_clean):
-                health_values_dict["Step"] = extract_field_value(line_clean, "Step")
-            elif patterns["legacy_id"].search(line_clean):
-                health_values_dict["Legacy ID"] = extract_field_value(line_clean, "Legacy ID")
-            elif patterns["gender"].search(line_clean):
-                health_values_dict["Gender"] = extract_field_value(line_clean, "Gender")
-            elif patterns["mda"].search(line_clean):
-                health_values_dict["MDA/School/Command"] = extract_field_value(line_clean, "MDA/School/Command")
-            elif patterns["ministry"].search(line_clean):
-                health_values_dict["Ministry"] = extract_field_value(line_clean, "Ministry")
-            elif patterns["tax_state"].search(line_clean):
-                health_values_dict["Tax State"] = extract_field_value(line_clean, "Tax State")
-            elif patterns["department"].search(line_clean):
-                health_values_dict["Department"] = extract_field_value(line_clean, "Department")
-            elif patterns["tin"].search(line_clean):
-                health_values_dict["TIN"] = extract_field_value(line_clean, "TIN")
-            elif patterns["location"].search(line_clean):
-                health_values_dict["Location"] = extract_field_value(line_clean, "Location")
-            elif patterns["date_of_appointment"].search(line_clean):
-                health_values_dict["Date of Appointment"] = extract_field_value(line_clean, "Date of Appointment")
-            elif patterns["job"].search(line_clean):
-                health_values_dict["Job"] = extract_field_value(line_clean, "Job")
-            elif patterns["date_of_birth"].search(line_clean):
-                health_values_dict["Date of Birth"] = extract_field_value(line_clean, "Date of Birth")
-            elif patterns["bank_name"].search(line_clean):
-                health_values_dict["Bank Name"] = extract_field_value(line_clean, "Bank Name")
-            elif patterns["pfa_name"].search(line_clean):
-                health_values_dict["PFA Name"] = extract_field_value(line_clean, "PFA Name")
-            elif patterns["account_number"].search(line_clean):
-                health_values_dict["Account Number"] = extract_field_value(line_clean, "Account Number")
-            elif patterns["pension_pin"].search(line_clean):
-                pension_pin = extract_field_value(line_clean, "Pension PIN")
-                health_values_dict["Pension PIN"] = pension_pin.replace("|", "") if "|" in pension_pin else pension_pin
-            elif patterns["total_gross"].search(line_clean):
-                health_values_dict["Total Gross Earnings"] = extract_field_value(line_clean, "Total Gross Earnings").replace("N", "")
-            elif patterns["total_net"].search(line_clean):
-                health_values_dict["Total Net Earnings"] = extract_field_value(line_clean, "Total Net Earnings").replace("N", "")
+            for field, pattern in patterns.items():
+                if pattern.search(line_clean):
+                    value = extract_field_value(line_clean)
+                    if "earnings" in field.lower():
+                        value = value.replace("N", "")
+                    health_values_dict[field.replace("_", " ").title()] = value
+                    break
     
     return health_values_dict
 
-def process_pdf(pdf_path):
-    """Process a single PDF file"""
+def process_pdf(pdf_path, img_temp_dir):
     filename = ntpath.basename(pdf_path).split(".")[0]
-    print(f"Processing: {filename}")
     
-    # Convert PDF to images
     images = convert_from_path(
         pdf_path,
-        output_folder=current_path + '/IMG',
-        fmt='png',
-        output_file=filename,
-        thread_count=4,  # Use multiple threads for conversion
-        # poppler_path=r"C:\Program Files\poppler-0.68.0\bin"
+        output_folder=img_temp_dir,
+        fmt='jpeg',
+        dpi=200,
+        grayscale=True,
+        thread_count=2,
     )
-    print(f'   {len(images)} images converted successfully for {filename}!')
     
-    print('   OCR processing started. Please wait...')
     health_values_dict = {}
     
-    # Process all images from this PDF
-    for image in images:
-        result = process_image(image)
-        # Merge results (later images may have better data)
-        health_values_dict.update(result)
+    with ThreadPoolExecutor(max_workers=min(2, len(images))) as executor:
+        results = list(executor.map(process_image, images))
+        for result in results:
+            health_values_dict.update(result)
+    
+    del images
+    gc.collect()
     
     return health_values_dict
 
-# Process PDFs in parallel
-with ThreadPoolExecutor(max_workers=min(4, len(files))) as executor:
-    future_to_pdf = {executor.submit(process_pdf, pdf_path): pdf_path for pdf_path in files}
+def main():
+    st.title("📄 PDF OCR Processor")
+    st.markdown("Extract payroll data from PDF payslips using OCR")
     
-    for future in as_completed(future_to_pdf):
-        pdf_path = future_to_pdf[future]
-        try:
-            result = future.result()
-            list_of_health_values.append(result)
-            print(f"Completed processing: {ntpath.basename(pdf_path)}")
-        except Exception as e:
-            print(f"Error processing {pdf_path}: {str(e)}")
+    uploaded_files = st.file_uploader(
+        "Upload PDF files", 
+        type="pdf", 
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        if st.button("🚀 Process PDFs", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Create temporary directories
+            with tempfile.TemporaryDirectory() as temp_dir:
+                img_temp_dir = os.path.join(temp_dir, "images")
+                pdf_temp_dir = os.path.join(temp_dir, "pdfs")
+                os.makedirs(img_temp_dir, exist_ok=True)
+                os.makedirs(pdf_temp_dir, exist_ok=True)
+                
+                # Save uploaded files
+                pdf_paths = []
+                for uploaded_file in uploaded_files:
+                    file_path = os.path.join(pdf_temp_dir, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    pdf_paths.append(file_path)
+                
+                list_of_health_values = []
+                list_of_health_labels = [
+                    "Payslip Date", "Employee Name", "IPPIS Number", "Total Gross Earnings", "Total Net Earnings",
+                    "Legacy ID", "MDA/School/Command", "Ministry", "Department", "Location",
+                    "Job", "Grade", "Step", "Gender", "Tax State", "TIN", "Date of Appointment",
+                    "Date of Birth", "Bank Name", "Account Number", "PFA Name", "Pension PIN"
+                ]
+                
+                all_pdf_files_to_process = []
+                for pdf_file in pdf_paths:
+                    status_text.text(f"Preparing: {ntpath.basename(pdf_file)}")
+                    split_files = split_pdf_by_pages(pdf_file, temp_dir)
+                    all_pdf_files_to_process.extend(split_files)
+                
+                total_files = len(all_pdf_files_to_process)
+                status_text.text(f"Processing {total_files} pages...")
+                
+                processed_count = 0
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    future_to_pdf = {executor.submit(process_pdf, pdf_path, img_temp_dir): pdf_path for pdf_path in all_pdf_files_to_process}
+                    
+                    for future in as_completed(future_to_pdf):
+                        pdf_path = future_to_pdf[future]
+                        try:
+                            result = future.result()
+                            list_of_health_values.append(result)
+                            processed_count += 1
+                            progress_bar.progress(processed_count / total_files)
+                            status_text.text(f"Processed {processed_count}/{total_files}: {ntpath.basename(pdf_path)}")
+                        except Exception as e:
+                            st.error(f"Error processing {pdf_path}: {str(e)}")
+                
+                # Generate CSV
+                if list_of_health_values:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_filename = f"payslip_data_{timestamp}.csv"
+                    
+                    csv_data = []
+                    for row in list_of_health_values:
+                        csv_data.append([row.get(label, "") for label in list_of_health_labels])
+                    
+                    # Display results
+                    st.success(f"✅ Processed {len(list_of_health_values)} records successfully!")
+                    
+                    # Show preview
+                    st.subheader("📊 Data Preview")
+                    st.dataframe(list_of_health_values[:10])
+                    
+                    # Download button
+                    csv_string = "\n".join([",".join(map(str, row)) for row in [list_of_health_labels] + csv_data])
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv_string,
+                        file_name=csv_filename,
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("No data extracted from the PDFs")
 
-print("\nWriting to CSV file.")
-# Write to file
-with open(csv_path, 'w', newline="", encoding='utf-8') as csvfile: 
-    writer = csv.DictWriter(csvfile, fieldnames=list_of_health_labels) 
-    writer.writeheader() 
-    writer.writerows(list_of_health_values)
-print("CSV file created!")
-
-print("\n=========Completed successfully!!!=========")
-
-print("\nWould you like to delete the temporary files? [y/n]")
-x = input().strip().lower()
-if x == "y":
-    # Delete the images
-    files = glob.glob(current_path + '/IMG' + '/*')
-    for f in files:
-        try:
-            os.remove(f)
-        except:
-            pass
-    print("Temporary files deleted successfully!")
-else:
-    print("Skipping cleanup!")
+if __name__ == "__main__":
+    main()
