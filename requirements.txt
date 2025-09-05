@@ -1,5 +1,13 @@
-streamlit
-pytesseract
-pdf2image
-pillow
-pandas
+# Core dependencies
+pytesseract==0.3.10
+pdf2image==1.16.3
+PyPDF2==3.0.1
+pillow==10.1.0
+
+# Additional dependencies for optimized code
+python-multipart==0.0.6
+opencv-python-headless==4.9.0.80  # For image processing (optional but recommended)
+
+# Required system dependencies (mention in README)
+# poppler-utils (for pdf2image)
+# tesseract-ocr (for pytesseract)
